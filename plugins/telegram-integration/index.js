@@ -725,7 +725,209 @@ async function callLLMApi(messages, preset) {
     }
 
     const data = await response.json();
-    return data.choices[0]?.message?.content || '';
+    return stripThinkingBlocks(data.choices[0]?.message?.content || '');
+}
+
+function stripThinkingBlocks(text) {
+    if (!text || typeof text !== 'string') return '';
+
+    const summarizeUpdateLines = (lines) => {
+        const bullets = [];
+        for (const rawLine of lines) {
+            const line = String(rawLine || '').trim();
+            if (!line) continue;
+
+            const noteMatch = line.match(/\/\/\s*备注[:：]\s*(.*)\s*$/);
+            const note = noteMatch ? noteMatch[1].trim() : '';
+
+            const setMatch = line.match(/_\.\s*set\s*\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]*)['"]\s*,\s*['"]([^'"]*)['"]\s*\)/i);
+            if (setMatch) {
+                const path = setMatch[1];
+                const from = setMatch[2];
+                const to = setMatch[3];
+                if (from && to && from !== to) {
+                    bullets.push(`- ${path}: ${from} → ${to}${note ? `（${note}）` : ''}`);
+                } else {
+                    bullets.push(`- ${path}: ${to}${note ? `（${note}）` : ''}`);
+                }
+                continue;
+            }
+
+            const addMatch = line.match(/_\.\s*add\s*\(\s*['"]([^'"]+)['"]\s*,\s*([+\-]?\d+(?:\.\d+)?)\s*\)/i);
+            if (addMatch) {
+                const path = addMatch[1];
+                const value = addMatch[2];
+                bullets.push(`- ${path}: +${value}${note ? `（${note}）` : ''}`);
+                continue;
+            }
+
+            const subMatch = line.match(/_\.\s*sub\s*\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]\s*,\s*([+\-]?\d+(?:\.\d+)?)\s*,/i);
+            if (subMatch) {
+                const path = subMatch[1];
+                const key = subMatch[2];
+                const value = subMatch[3];
+                bullets.push(`- ${path}.${key}: -${value}${note ? `（${note}）` : ''}`);
+                continue;
+            }
+
+            const assignMatch = line.match(/_\.\s*assign\s*\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]\s*,\s*(\{[\s\S]*\})\s*\)\s*;?/i);
+            if (assignMatch) {
+                const path = assignMatch[1];
+                const key = assignMatch[2];
+                const jsonLike = assignMatch[3];
+                let name = '';
+                let qty = '';
+                try {
+                    const obj = JSON.parse(jsonLike);
+                    const maybeName = obj?.["名称"]?.[0];
+                    if (typeof maybeName === 'string') name = maybeName;
+                    const maybeQty = obj?.["数量"]?.[0];
+                    if (typeof maybeQty === 'number' || typeof maybeQty === 'string') qty = String(maybeQty);
+                } catch {
+                    const nameMatch = jsonLike.match(/"名称"\s*:\s*\[\s*"([^"]+)"/);
+                    if (nameMatch) name = nameMatch[1];
+                    const qtyMatch = jsonLike.match(/"数量"\s*:\s*\[\s*([0-9]+)/);
+                    if (qtyMatch) qty = qtyMatch[1];
+                }
+                const label = name ? `${name}` : key;
+                const qtyLabel = qty ? ` x${qty}` : '';
+                bullets.push(`- ${path}.${key}: 获得 ${label}${qtyLabel}${note ? `（${note}）` : ''}`);
+                continue;
+            }
+
+            // Fallback: include note or a compact form of the command.
+            if (note) {
+                bullets.push(`- ${note}`);
+            }
+        }
+
+        if (bullets.length === 0) return '';
+        return `\n\n📌 变更摘要\n${bullets.slice(0, 20).join('\n')}`;
+    };
+
+    const replaceUpdateVariableBlocks = (input) => {
+        let out = input;
+        const blocks = [];
+        out = out.replace(/<updatevariable\b[^>]*>([\s\S]*?)<\/updatevariable>/gi, (_, inner) => {
+            blocks.push(inner);
+            return '';
+        });
+        for (const inner of blocks) {
+            const lines = String(inner || '').split('\n');
+            out += summarizeUpdateLines(lines);
+        }
+        return out;
+    };
+
+    let out = text;
+    out = out.replace(/<thinking\b[^>]*>[\s\S]*?<\/thinking>/gi, '');
+    out = out.replace(/<analysis\b[^>]*>[\s\S]*?<\/analysis>/gi, '');
+    out = out.replace(/^\s*思考结束\s*$/gmi, '');
+    out = replaceUpdateVariableBlocks(out);
+    out = out.replace(/^\s+\n/, '');
+    return out.trim();
+}
+
+function createThinkingStripper() {
+    const openTags = ['<thinking>', '<analysis>', '<updatevariable'];
+    const closeTags = ['</thinking>', '</analysis>', '</updatevariable>'];
+    const maxTagLen = Math.max(...openTags.map(t => t.length), ...closeTags.map(t => t.length));
+
+    let carry = '';
+    let inHidden = false;
+    let hiddenKind = 'drop'; // 'drop' | 'update'
+    let updateBuf = '';
+
+    function indexOfAny(haystack, needles) {
+        const lower = haystack.toLowerCase();
+        let bestIndex = -1;
+        let bestNeedle = null;
+        for (const needle of needles) {
+            const idx = lower.indexOf(needle);
+            if (idx === -1) continue;
+            if (bestIndex === -1 || idx < bestIndex) {
+                bestIndex = idx;
+                bestNeedle = needle;
+            }
+        }
+        return { index: bestIndex, needle: bestNeedle };
+    }
+
+    function emitSafeTail() {
+        if (inHidden) return '';
+        // If carry looks like the beginning of a tag, drop it.
+        if (carry.trimStart().startsWith('<think') || carry.trimStart().startsWith('<anal')) return '';
+        const out = carry;
+        carry = '';
+        return out;
+    }
+
+    return {
+        feed(delta) {
+            if (!delta || typeof delta !== 'string') return '';
+
+            let input = carry + delta;
+            let output = '';
+
+            while (input.length) {
+                if (!inHidden) {
+                    const { index, needle } = indexOfAny(input, openTags);
+                    if (index === -1) {
+                        const keep = Math.min(maxTagLen - 1, input.length);
+                        output += input.slice(0, input.length - keep);
+                        carry = input.slice(input.length - keep);
+                        input = '';
+                    } else {
+                        output += input.slice(0, index);
+                        input = input.slice(index + needle.length);
+                        inHidden = true;
+                        carry = '';
+                        if (String(needle).toLowerCase().startsWith('<updatevariable')) {
+                            hiddenKind = 'update';
+                            updateBuf = '';
+                        } else {
+                            hiddenKind = 'drop';
+                        }
+                    }
+                } else {
+                    const { index, needle } = indexOfAny(input, closeTags);
+                    if (index === -1) {
+                        const keep = Math.min(maxTagLen - 1, input.length);
+                        if (hiddenKind === 'update') {
+                            updateBuf += input.slice(0, input.length - keep);
+                        }
+                        carry = input.slice(input.length - keep);
+                        input = '';
+                    } else {
+                        if (hiddenKind === 'update') {
+                            updateBuf += input.slice(0, index);
+                            const summary = stripThinkingBlocks(`<updatevariable>${updateBuf}</updatevariable>`);
+                            if (summary) output += `\n${summary}\n`;
+                            updateBuf = '';
+                        }
+                        input = input.slice(index + needle.length);
+                        inHidden = false;
+                        carry = '';
+                    }
+                }
+            }
+
+            // Strip any full blocks that may have slipped through in one chunk, and summarize updatevariable.
+            return stripThinkingBlocks(output);
+        },
+        flush() {
+            if (inHidden && hiddenKind === 'update' && (updateBuf || carry)) {
+                const combined = updateBuf + carry;
+                updateBuf = '';
+                carry = '';
+                inHidden = false;
+                hiddenKind = 'drop';
+                const summary = stripThinkingBlocks(`<updatevariable>${combined}</updatevariable>`);
+                return summary ? `\n${summary}\n` : '';
+            }
+            return stripThinkingBlocks(emitSafeTail());
+        }
+    };
 }
 
 async function callLLMApiStream(messages, preset, onDelta, signal) {
@@ -768,7 +970,9 @@ async function callLLMApiStream(messages, preset, onDelta, signal) {
     const reader = response.body.getReader();
     const decoder = new TextDecoder('utf-8');
     let buffer = '';
-    let fullText = '';
+    let rawSoFar = '';
+    let visibleText = '';
+    const stripper = createThinkingStripper();
 
     try {
         while (true) {
@@ -790,7 +994,11 @@ async function callLLMApiStream(messages, preset, onDelta, signal) {
                     if (!line.startsWith('data:')) continue;
                     const data = line.slice(5).trim();
                     if (!data) continue;
-                    if (data === '[DONE]') return fullText;
+                    if (data === '[DONE]') {
+                        const tail = stripper.flush();
+                        if (tail) visibleText += tail;
+                        return visibleText;
+                    }
 
                     let parsed;
                     try {
@@ -799,12 +1007,27 @@ async function callLLMApiStream(messages, preset, onDelta, signal) {
                         continue;
                     }
 
-                    const delta = parsed?.choices?.[0]?.delta?.content;
-                    if (!delta) continue;
+                    const content =
+                        parsed?.choices?.[0]?.delta?.content ??
+                        parsed?.choices?.[0]?.message?.content ??
+                        parsed?.choices?.[0]?.text;
+                    if (!content) continue;
 
-                    fullText += delta;
+                    // Some providers stream "full text so far" each event.
+                    let incremental = content;
+                    if (typeof content === 'string' && rawSoFar && content.startsWith(rawSoFar)) {
+                        incremental = content.slice(rawSoFar.length);
+                        rawSoFar = content;
+                    } else {
+                        rawSoFar += content;
+                    }
+
+                    const filtered = stripper.feed(incremental);
+                    if (!filtered) continue;
+
+                    visibleText += filtered;
                     try {
-                        onDelta?.(delta, fullText);
+                        onDelta?.(filtered, visibleText);
                     } catch {
                         // ignore delta callback errors
                     }
@@ -819,7 +1042,9 @@ async function callLLMApiStream(messages, preset, onDelta, signal) {
         }
     }
 
-    return fullText;
+    const tail = stripper.flush();
+    if (tail) visibleText += tail;
+    return visibleText;
 }
 
 // ============================================
