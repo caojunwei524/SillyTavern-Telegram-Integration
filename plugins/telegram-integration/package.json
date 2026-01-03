@@ -1,0 +1,11 @@
+{
+  "name": "telegram-integration",
+  "display_name": "Telegram Integration",
+  "version": "2.0.0",
+  "description": "API endpoints for Telegram Bot integration with SillyTavern",
+  "author": "SillyTavern-Telegram-Integration",
+  "license": "MIT",
+  "dependencies": {
+    "png-chunks-extract": "^1.0.0"
+  }
+}
