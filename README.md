@@ -459,4 +459,4 @@ ST_AUTH_PASS=your_password
 
 ## 许可证
 
-MIT License
+本项目采用 Apache License 2.0，详见 `LICENSE`。
