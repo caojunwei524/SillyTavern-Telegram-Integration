@@ -54,6 +54,13 @@ TELEGRAM_STREAM_EDIT_INTERVAL_MS = int(os.getenv('TELEGRAM_STREAM_EDIT_INTERVAL_
 TELEGRAM_TYPING_INTERVAL_MS = int(os.getenv('TELEGRAM_TYPING_INTERVAL_MS', '3500'))
 TELEGRAM_STREAM_PLACEHOLDER = os.getenv('TELEGRAM_STREAM_PLACEHOLDER', '输入中...')
 
+# Optional per-user model menu choices (comma-separated)
+TG_MODEL_CHOICES = [
+    m.strip()
+    for m in os.getenv('TG_MODEL_CHOICES', 'gpt-4o-mini,gpt-4o,gpt-4.1-mini,gpt-4.1').split(',')
+    if m.strip()
+]
+
 # Logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -95,7 +102,8 @@ class AuthStore:
             "registrationEnabled": registration_enabled_default,
             "allowedUsers": {},
             "pendingUsers": {},
-            "invites": {}
+            "invites": {},
+            "userSettings": {}
         }
         self._loaded = False
 
@@ -105,6 +113,8 @@ class AuthStore:
         try:
             if self.path.exists():
                 self.data = json.loads(self.path.read_text(encoding='utf-8'))
+                if not isinstance(self.data.get("userSettings"), dict):
+                    self.data["userSettings"] = {}
                 self._loaded = True
                 return
         except Exception as e:
@@ -258,6 +268,45 @@ class AuthStore:
         allowed = self.data.get("allowedUsers") or {}
         return [allowed[k] for k in sorted(allowed.keys())]
 
+    def get_user_llm_model(self, user_id: int) -> Optional[str]:
+        settings = self.data.get("userSettings") or {}
+        entry = settings.get(str(user_id)) if isinstance(settings, dict) else None
+        if not isinstance(entry, dict):
+            return None
+        model = entry.get("llmModel")
+        if not isinstance(model, str):
+            return None
+        model = model.strip()
+        return model or None
+
+    async def set_user_llm_model(self, user_id: int, model: Optional[str]) -> None:
+        key = str(user_id)
+        normalized = None
+        if isinstance(model, str):
+            normalized = model.strip() or None
+
+        async with self._lock:
+            settings = self.data.get("userSettings")
+            if not isinstance(settings, dict):
+                settings = {}
+
+            entry = settings.get(key)
+            if not isinstance(entry, dict):
+                entry = {}
+
+            if normalized is None:
+                entry.pop("llmModel", None)
+                if entry:
+                    settings[key] = entry
+                else:
+                    settings.pop(key, None)
+            else:
+                entry["llmModel"] = normalized
+                settings[key] = entry
+
+            self.data["userSettings"] = settings
+            await self._save_unlocked()
+
 
 class SillyTavernClient:
     """SillyTavern API Client"""
@@ -277,6 +326,12 @@ class SillyTavernClient:
         response = await http_client.post(url, json=data)
         response.raise_for_status()
         return response.json()
+
+    async def get_plugin_config(self) -> Dict[str, Any]:
+        return await self._get('/config')
+
+    async def set_plugin_config(self, updates: dict) -> Dict[str, Any]:
+        return await self._post('/config', updates)
 
     async def health_check(self) -> bool:
         try:
@@ -318,20 +373,25 @@ class SillyTavernClient:
             'worldInfoName': world_name
         })
 
-    async def send_message(self, user_id: str, message: str, user_name: str) -> Dict[str, Any]:
-        return await self._post('/send', {
+    async def send_message(self, user_id: str, message: str, user_name: str, llm_model: Optional[str] = None) -> Dict[str, Any]:
+        payload = {
             'telegramUserId': user_id,
             'message': message,
             'user': user_name
-        })
+        }
+        if isinstance(llm_model, str) and llm_model.strip():
+            payload['llmModel'] = llm_model.strip()
+        return await self._post('/send', payload)
 
-    async def send_message_stream(self, user_id: str, message: str, user_name: str) -> AsyncIterator[Dict[str, Any]]:
+    async def send_message_stream(self, user_id: str, message: str, user_name: str, llm_model: Optional[str] = None) -> AsyncIterator[Dict[str, Any]]:
         url = f"{self.base_url}{self.api_prefix}/send/stream"
         payload = {
             'telegramUserId': user_id,
             'message': message,
             'user': user_name
         }
+        if isinstance(llm_model, str) and llm_model.strip():
+            payload['llmModel'] = llm_model.strip()
 
         async with http_client.stream(
             "POST",
@@ -445,7 +505,9 @@ def get_main_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🧹 一键清除全部历史", callback_data="menu_clear_all")],
         [InlineKeyboardButton("ℹ️ 当前状态", callback_data="menu_status")],
     ]
+    keyboard.insert(3, [InlineKeyboardButton("🧠 我的模型", callback_data="menu_my_model")])
     return InlineKeyboardMarkup(keyboard)
+
 
 async def send_typing_periodically(chat, interval_ms: int) -> None:
     interval_s = max(0.5, interval_ms / 1000.0)
@@ -900,6 +962,7 @@ async def handle_message_streaming_ui(update: Update, context: ContextTypes.DEFA
     user_id = str(update.effective_user.id)
     user_name = update.effective_user.first_name or "User"
     message = update.message.text
+    llm_model = auth_store.get_user_llm_model(update.effective_user.id)
 
     typing_task = asyncio.create_task(send_typing_periodically(update.message.chat, TELEGRAM_TYPING_INTERVAL_MS))
     try:
@@ -915,7 +978,7 @@ async def handle_message_streaming_ui(update: Update, context: ContextTypes.DEFA
         last_edit = 0.0
         edit_interval_s = max(0.2, TELEGRAM_STREAM_EDIT_INTERVAL_MS / 1000.0)
 
-        async for event in st_client.send_message_stream(user_id, message, user_name):
+        async for event in st_client.send_message_stream(user_id, message, user_name, llm_model=llm_model):
             if isinstance(event.get('error'), str) and event['error']:
                 raise RuntimeError(event['error'])
 
@@ -1088,6 +1151,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 /presets - 预设列表
 /worlds - 世界书列表
 /clear - 清除对话历史
+/mymodel - 我的模型（仅对自己生效）
+/delmodel - 删除我的模型（恢复默认）
+
+**模型（管理员）：**
+/model - 查看/设置默认模型（别名：/llm）
 
 **使用方法：**
 1. 选择角色 → 选择预设 → 开始对话
@@ -1275,6 +1343,100 @@ async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(("已移除授权" if removed else "目标不在授权列表") + f"：{target}")
 
 
+async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_chat or update.effective_chat.type != 'private':
+        return
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        return
+
+    try:
+        if not getattr(context, "args", None):
+            result = await st_client.get_plugin_config()
+            cfg = result.get("config", {}) if isinstance(result, dict) else {}
+            current = cfg.get("llmModel") or "unknown"
+            await send_text_safe(update.message.reply_text, f"当前模型：`{current}`\n用法：`/model <模型名>`", parse_mode='Markdown')
+            return
+
+        model_name = " ".join(str(a) for a in context.args).strip()
+        if not model_name:
+            await update.message.reply_text("用法：/model <模型名>")
+            return
+
+        updated = await st_client.set_plugin_config({"llmModel": model_name})
+        if isinstance(updated, dict) and updated.get("success") is False:
+            await update.message.reply_text(f"设置失败：{updated.get('error', 'unknown error')}")
+            return
+
+        verify = await st_client.get_plugin_config()
+        cfg = verify.get("config", {}) if isinstance(verify, dict) else {}
+        current = cfg.get("llmModel") or model_name
+        await send_text_safe(update.message.reply_text, f"✅ 已切换模型为：`{current}`", parse_mode='Markdown')
+    except Exception as e:
+        await update.message.reply_text(f"❌ 设置模型失败：{e}")
+
+
+async def cmd_mymodel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_chat or update.effective_chat.type != 'private':
+        return
+    if not update.effective_user:
+        return
+    if not is_authorized(update.effective_user.id):
+        await maybe_send_register_hint(update)
+        return
+
+    user_id = update.effective_user.id
+    user_model = auth_store.get_user_llm_model(user_id)
+    default_model: Optional[str] = None
+    try:
+        result = await st_client.get_plugin_config()
+        cfg = result.get("config", {}) if isinstance(result, dict) else {}
+        default_model = cfg.get("llmModel")
+    except Exception:
+        default_model = None
+
+    default_model = str(default_model).strip() if isinstance(default_model, str) else None
+    effective_model = user_model or default_model or "unknown"
+
+    if not getattr(context, "args", None):
+        await send_text_safe(
+            update.message.reply_text,
+            "🧠 **我的模型（仅对你生效）**\n\n"
+            f"- 当前：`{md_escape(effective_model)}`\n"
+            f"- 我的覆盖：`{md_escape(user_model or '（未设置）')}`\n"
+            f"- 默认：`{md_escape(default_model or 'unknown')}`\n\n"
+            "用法：\n"
+            "- `/mymodel <模型名>` 设置我的模型\n"
+            "- `/mymodel clear` 删除我的模型（恢复默认）",
+            parse_mode='Markdown',
+        )
+        return
+
+    arg = " ".join(str(a) for a in context.args).strip()
+    if arg.lower() in ("clear", "default", "reset", "del", "delete", "remove", "off", "0", "none"):
+        await auth_store.set_user_llm_model(user_id, None)
+        await update.message.reply_text("✅ 已删除我的模型设置（恢复默认）。")
+        return
+
+    if not arg:
+        await update.message.reply_text("用法：/mymodel <模型名> 或 /mymodel clear")
+        return
+
+    await auth_store.set_user_llm_model(user_id, arg)
+    await send_text_safe(update.message.reply_text, f"✅ 已设置我的模型为：`{md_escape(arg)}`", parse_mode='Markdown')
+
+
+async def cmd_delmodel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_chat or update.effective_chat.type != 'private':
+        return
+    if not update.effective_user:
+        return
+    if not is_authorized(update.effective_user.id):
+        await maybe_send_register_hint(update)
+        return
+    await auth_store.set_user_llm_model(update.effective_user.id, None)
+    await update.message.reply_text("✅ 已删除我的模型设置（恢复默认）。")
+
+
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
         return
@@ -1299,6 +1461,20 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 📚 世界书: {s.get('worldInfoName') or '无'}
 💬 历史: {s.get('historyLength', 0)} 条消息
 """
+        user_model = auth_store.get_user_llm_model(update.effective_user.id)
+        default_model = None
+        try:
+            cfg_result = await st_client.get_plugin_config()
+            cfg = cfg_result.get("config", {}) if isinstance(cfg_result, dict) else {}
+            default_model = cfg.get("llmModel")
+        except Exception:
+            default_model = None
+
+        default_model = str(default_model).strip() if isinstance(default_model, str) else None
+        effective_model = user_model or default_model or "unknown"
+        note = "（我的覆盖）" if user_model else "（默认）"
+        text += f"\n🧠 模型: `{md_escape(effective_model)}` {note}\n"
+
         await send_text_safe(update.message.reply_text, text, parse_mode='Markdown')
     except Exception as e:
         logger.error(f"Status error: {e}")
@@ -1347,7 +1523,7 @@ async def cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     await update.message.reply_text(
         "未识别的命令。\n"
-        "可用命令：/start /help /status /chars /presets /worlds /clear\n"
+        "可用命令：/start /help /status /chars /presets /worlds /clear /mymodel /delmodel\n"
         "多用户：/register\n"
         "（管理员：/invite /pending /approve /revoke /registration /users）"
     )
@@ -1365,11 +1541,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = str(update.effective_user.id)
     user_name = update.effective_user.first_name or "User"
     message = update.message.text
+    llm_model = auth_store.get_user_llm_model(update.effective_user.id)
 
     await update.message.chat.send_action('typing')
 
     try:
-        result = await st_client.send_message(user_id, message, user_name)
+        result = await st_client.send_message(user_id, message, user_name, llm_model=llm_model)
 
         if result.get('success'):
             ai_response = result.get('message', '...')
@@ -1534,6 +1711,70 @@ async def show_worldinfo(update: Update, context: ContextTypes.DEFAULT_TYPE,
             await update.message.reply_text(text)
 
 
+async def show_my_model_menu(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                             is_callback: bool = True) -> None:
+    query = update.callback_query if is_callback else None
+    if query:
+        await query.answer()
+
+    user = update.effective_user
+    if not user:
+        return
+    if not is_authorized(user.id):
+        await maybe_send_register_hint(update)
+        return
+
+    user_model = auth_store.get_user_llm_model(user.id)
+    default_model = None
+    try:
+        result = await st_client.get_plugin_config()
+        cfg = result.get("config", {}) if isinstance(result, dict) else {}
+        default_model = cfg.get("llmModel")
+    except Exception:
+        default_model = None
+
+    default_model = str(default_model).strip() if isinstance(default_model, str) else None
+    effective_model = user_model or default_model or "unknown"
+
+    models: list[str] = []
+    for m in ([default_model] if default_model else []) + TG_MODEL_CHOICES + ([user_model] if user_model else []):
+        if not isinstance(m, str):
+            continue
+        m = m.strip()
+        if not m or m in models:
+            continue
+        if len(m) > 50:
+            continue
+        models.append(m)
+
+    keyboard: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for m in models[:10]:
+        label = m if len(m) <= 20 else (m[:19] + "…")
+        row.append(InlineKeyboardButton(label, callback_data=f"my_model_set:{m}"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+
+    keyboard.append([InlineKeyboardButton("♻️ 使用默认", callback_data="my_model_clear")])
+    keyboard.append([InlineKeyboardButton("🔙 返回", callback_data="menu_main")])
+
+    text = (
+        "🧠 **我的模型**（仅对你生效）\n\n"
+        f"- 当前：`{md_escape(effective_model)}`\n"
+        f"- 我的覆盖：`{md_escape(user_model or '（未设置）')}`\n"
+        f"- 默认：`{md_escape(default_model or 'unknown')}`\n\n"
+        "点击按钮切换，或用 `/mymodel <模型名>` 设置，`/delmodel` 删除。"
+    )
+
+    if query:
+        await send_text_safe(query.edit_message_text, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    else:
+        await send_text_safe(update.message.reply_text, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+
 async def show_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -1649,8 +1890,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data == "menu_worldinfo":
         await show_worldinfo(update, context)
 
+    elif data == "menu_my_model":
+        await show_my_model_menu(update, context)
+
     elif data == "menu_history":
         await show_history(update, context)
+
+    elif data == "my_model_clear":
+        await query.answer()
+        await auth_store.set_user_llm_model(actor_id, None)
+        await show_my_model_menu(update, context)
+
+    elif data.startswith("my_model_set:"):
+        await query.answer()
+        model_name = data.split(":", 1)[1].strip()
+        if not model_name:
+            await query.edit_message_text("模型名为空。")
+            return
+        await auth_store.set_user_llm_model(actor_id, model_name)
+        await show_my_model_menu(update, context)
 
     elif data.startswith("hist_"):
         await query.answer()
@@ -1724,6 +1982,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 💬 历史: {s.get('historyLength', 0)} 条
 """
             keyboard = [[InlineKeyboardButton("🔙 返回", callback_data="menu_main")]]
+            user_model = auth_store.get_user_llm_model(actor_id)
+            default_model = None
+            try:
+                cfg_result = await st_client.get_plugin_config()
+                cfg = cfg_result.get("config", {}) if isinstance(cfg_result, dict) else {}
+                default_model = cfg.get("llmModel")
+            except Exception:
+                default_model = None
+            default_model = str(default_model).strip() if isinstance(default_model, str) else None
+            effective_model = user_model or default_model or "unknown"
+            note = "（我的覆盖）" if user_model else "（默认）"
+            text += f"\n🧠 模型: `{md_escape(effective_model)}` {note}\n"
+
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard),
                                            parse_mode='Markdown')
         except Exception as e:
@@ -1927,6 +2198,11 @@ def main() -> None:
     app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("approve", cmd_approve))
     app.add_handler(CommandHandler("revoke", cmd_revoke))
+    app.add_handler(CommandHandler("model", cmd_model))
+    app.add_handler(CommandHandler("llm", cmd_model))
+    app.add_handler(CommandHandler("mymodel", cmd_mymodel))
+    app.add_handler(CommandHandler("umodel", cmd_mymodel))
+    app.add_handler(CommandHandler("delmodel", cmd_delmodel))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("stats", cmd_status))
     app.add_handler(CommandHandler("stars", cmd_status))

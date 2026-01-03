@@ -520,7 +520,7 @@ function replaceMacros(text, char, userName, extras = {}) {
         .replace(/{{persona}}/gi, extras.persona || '')
         .replace(/{{mesExamples}}/gi, char?.mes_example || '')
         .replace(/{{char_version}}/gi, '')
-        .replace(/{{model}}/gi, pluginConfig.llmModel)
+        .replace(/{{model}}/gi, extras.model || pluginConfig.llmModel)
         // 时间宏
         .replace(/{{time}}/gi, timeMacros.time)
         .replace(/{{date}}/gi, timeMacros.date)
@@ -544,7 +544,7 @@ function replaceMacros(text, char, userName, extras = {}) {
 // 提示词构建
 // ============================================
 
-function buildPromptMessages(session, character, userName, newMessage, preset, worldInfo) {
+function buildPromptMessages(session, character, userName, newMessage, preset, worldInfo, modelName = '') {
     const messages = [];
 
     // 获取匹配的 WorldInfo
@@ -553,7 +553,7 @@ function buildPromptMessages(session, character, userName, newMessage, preset, w
 
     // 获取最后一条用户消息的时间戳
     const lastUserMsg = [...session.chatHistory].reverse().find(m => m.role === 'user');
-    const macroExtras = { lastUserMessageTime: lastUserMsg?.timestamp };
+    const macroExtras = { lastUserMessageTime: lastUserMsg?.timestamp, model: modelName };
 
     // 构建系统消息
     let systemContent = '';
@@ -693,7 +693,7 @@ function parseExampleMessages(mesExample, charName, userName) {
 // LLM API 调用
 // ============================================
 
-async function callLLMApi(messages, preset) {
+async function callLLMApi(messages, preset, modelName = '') {
     if (!pluginConfig.llmApiKey) {
         throw new Error('LLM_API_KEY not configured');
     }
@@ -701,7 +701,7 @@ async function callLLMApi(messages, preset) {
     const url = `${pluginConfig.llmApiUrl}/chat/completions`;
 
     const requestBody = {
-        model: pluginConfig.llmModel,
+        model: modelName || pluginConfig.llmModel,
         messages: messages,
         max_tokens: preset.max_tokens || pluginConfig.maxTokens,
         temperature: preset.temperature ?? pluginConfig.temperature,
@@ -930,7 +930,7 @@ function createThinkingStripper() {
     };
 }
 
-async function callLLMApiStream(messages, preset, onDelta, signal) {
+async function callLLMApiStream(messages, preset, onDelta, signal, modelName = '') {
     if (!pluginConfig.llmApiKey) {
         throw new Error('LLM_API_KEY not configured');
     }
@@ -938,7 +938,7 @@ async function callLLMApiStream(messages, preset, onDelta, signal) {
     const url = `${pluginConfig.llmApiUrl}/chat/completions`;
 
     const requestBody = {
-        model: pluginConfig.llmModel,
+        model: modelName || pluginConfig.llmModel,
         messages: messages,
         stream: true,
         max_tokens: preset.max_tokens || pluginConfig.maxTokens,
@@ -1417,7 +1417,7 @@ async function init(router) {
     // 发送消息
     router.post('/send', async (req, res) => {
         try {
-            const { message, user, telegramUserId } = req.body;
+            const { message, user, telegramUserId, llmModel } = req.body;
 
             if (!message) {
                 return res.status(400).json({ success: false, error: 'message required' });
@@ -1426,6 +1426,8 @@ async function init(router) {
             const directories = req.app.locals?.directories;
             const session = getSession(telegramUserId || 'default');
             const userName = user || 'User';
+            const requestedModel = typeof llmModel === 'string' ? llmModel.trim() : '';
+            const effectiveModel = requestedModel || pluginConfig.llmModel;
 
             // 加载角色
             if (!session.characterData && session.characterId !== null) {
@@ -1447,13 +1449,14 @@ async function init(router) {
                 userName,
                 message,
                 preset,
-                worldInfo
+                worldInfo,
+                effectiveModel
             );
 
             // 调用 LLM
             let aiContent;
             try {
-                aiContent = await callLLMApi(messages, preset);
+                aiContent = await callLLMApi(messages, preset, effectiveModel);
             } catch (llmError) {
                 console.error('[TG] LLM error:', llmError.message);
                 return res.status(500).json({
@@ -1463,7 +1466,7 @@ async function init(router) {
             }
 
             // 替换宏
-            aiContent = replaceMacros(aiContent, session.characterData, userName);
+            aiContent = replaceMacros(aiContent, session.characterData, userName, { model: effectiveModel });
 
             // 保存历史
             session.chatHistory.push(
@@ -1511,7 +1514,7 @@ async function init(router) {
         }, 15000);
 
         try {
-            const { message, user, telegramUserId } = req.body;
+            const { message, user, telegramUserId, llmModel } = req.body;
 
             if (!message) {
                 res.write(`data: ${JSON.stringify({ error: 'message required' })}\n\n`);
@@ -1522,6 +1525,8 @@ async function init(router) {
             const directories = req.app.locals?.directories;
             const session = getSession(telegramUserId || 'default');
             const userName = user || 'User';
+            const requestedModel = typeof llmModel === 'string' ? llmModel.trim() : '';
+            const effectiveModel = requestedModel || pluginConfig.llmModel;
 
             if (!session.characterData && session.characterId !== null) {
                 session.characterData = getCharacterById(directories, session.characterId);
@@ -1538,7 +1543,8 @@ async function init(router) {
                 userName,
                 message,
                 preset,
-                worldInfo
+                worldInfo,
+                effectiveModel
             );
 
             res.write(`data: ${JSON.stringify({ started: true })}\n\n`);
@@ -1552,7 +1558,8 @@ async function init(router) {
                         res.write(`data: ${JSON.stringify({ delta })}\n\n`);
                         if (typeof res.flush === 'function') res.flush();
                     },
-                    abortController.signal
+                    abortController.signal,
+                    effectiveModel
                 );
             } catch (llmError) {
                 console.error('[TG] Stream LLM error:', llmError.message);
@@ -1561,7 +1568,7 @@ async function init(router) {
                 return res.end();
             }
 
-            const finalMessage = replaceMacros(rawContent, session.characterData, userName);
+            const finalMessage = replaceMacros(rawContent, session.characterData, userName, { model: effectiveModel });
 
             session.chatHistory.push(
                 { role: 'user', content: message, timestamp: Date.now() },

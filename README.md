@@ -112,7 +112,7 @@ docker compose restart sillytavern
 ```
 
 **代码更新与重启策略（重要）**
-- 修改 `telegram-bot/bot.py`（Bot 代码）：需要重建并更新容器：`docker compose up -d --build telegram-bot`
+- 修改 `telegram-bot/bot.py`（Bot 代码）：需要重建并更新容器：`docker compose up -d --build --force-recreate telegram-bot`（注意 `--force-recreate` 是一个完整参数，不要写成 `--force- recreate`）
 - 修改 `plugins/telegram-integration/index.js`（插件代码）：只需重启 SillyTavern：`docker compose restart sillytavern`
 - 修改 `.env`（环境变量）：用 `docker compose up -d` 重新创建容器（`restart` 不会更新 env）
 - 数据安全说明：`./data`、`./config`、`./plugins` 都是挂载目录，重建容器不会丢角色卡/预设/世界书/配置
@@ -206,6 +206,9 @@ docker compose ps
 | `/presets` | 预设列表 |
 | `/worlds` | 世界书列表 |
 | `/clear` | 清除对话历史 |
+| `/model` | （管理员）查看/设置默认模型：`/model <模型名>`（别名：`/llm`） |
+| `/mymodel` | 查看/设置“我的模型”（仅对自己生效）：`/mymodel <模型名>` / `/mymodel clear`（别名：`/umodel`） |
+| `/delmodel` | 删除“我的模型”覆盖（恢复默认） |
 | `/register` | 申请/使用邀请码开通权限 |
 | `/invite` | （管理员）生成一次性邀请码 |
 | `/users` | （管理员）查看已授权用户 |
@@ -213,6 +216,11 @@ docker compose ps
 | `/approve` | （管理员）通过申请 |
 | `/revoke` | （管理员）移除授权 |
 | `/registration` | （管理员）开/关注册 |
+
+### 模型切换说明
+
+- “默认模型”：管理员用 `/model <模型名>` 写入插件配置（持久化到 `plugins/telegram-integration/config.json`），影响所有用户未覆盖的情况。
+- “我的模型”：用户用 `/mymodel <模型名>` 设置个人覆盖（持久化到 `data/telegram-bot/auth.json`），只影响自己；用 `/delmodel` 或 `/mymodel clear` 删除覆盖恢复默认。
 
 ## 配置说明
 
