@@ -471,6 +471,19 @@ async def edit_message_if_changed(message_obj, text: str) -> None:
         raise
 
 
+async def edit_message_html_if_changed(message_obj, html_text: str) -> None:
+    try:
+        await message_obj.edit_text(html_text, parse_mode='HTML', disable_web_page_preview=True)
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            return
+        if "Can't parse entities" in str(e):
+            safe = re.sub(r"<[^>]+>", "", html_text)
+            await edit_message_if_changed(message_obj, safe)
+            return
+        raise
+
+
 async def send_long_plain_text(bot, chat_id: int, text: str, *, chunk_size: int = 4000) -> None:
     if not text:
         return
@@ -619,6 +632,152 @@ async def send_statusblock_html(bot, chat_id: int, text: str) -> bool:
     return True
 
 
+def parse_status_fields_partial(text: str) -> Dict[str, str]:
+    text = _strip_code_fences(text or "")
+    lowered = text.lower()
+
+    start_tag = None
+    if "<stausblock" in lowered:
+        start_tag = "stausblock"
+    elif "<statusblock" in lowered:
+        start_tag = "statusblock"
+    if not start_tag:
+        return {}
+
+    start_marker = f"<{start_tag}>"
+    start_index = lowered.find(start_marker)
+    if start_index == -1:
+        return {}
+
+    inner = text[start_index + len(start_marker):]
+    end_marker = f"</{start_tag}>"
+    end_index = inner.lower().find(end_marker)
+    if end_index != -1:
+        inner = inner[:end_index]
+
+    pairs = re.findall(r"<([^<>/\s]+)>([\s\S]*?)</\1>", inner)
+    result: Dict[str, str] = {}
+    for tag, value in pairs:
+        tag = str(tag).strip()
+        if not tag or tag.lower() in ("stausblock", "statusblock"):
+            continue
+        result[tag] = str(value).strip()
+    return result
+
+
+def extract_partial_between(text: str, start_tag: str, end_tag: str, *, stop_tags: Optional[list[str]] = None) -> Optional[str]:
+    if not text:
+        return None
+    lowered = text.lower()
+    start = lowered.find(start_tag.lower())
+    if start == -1:
+        return None
+    start += len(start_tag)
+    after = text[start:]
+    after_lower = after.lower()
+
+    candidates: list[int] = []
+    end_pos = after_lower.find(end_tag.lower())
+    if end_pos != -1:
+        candidates.append(end_pos)
+
+    if stop_tags:
+        for tag in stop_tags:
+            p = after_lower.find(tag.lower())
+            if p != -1:
+                candidates.append(p)
+
+    cut = min(candidates) if candidates else len(after)
+    return after[:cut].strip()
+
+
+def split_text_pages(text: str, *, max_chars: int) -> list[str]:
+    if not text:
+        return [""]
+    pages: list[str] = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= max_chars:
+            pages.append(remaining)
+            break
+        cut = remaining.rfind("\n", 0, max_chars)
+        if cut == -1 or cut < int(max_chars * 0.6):
+            cut = max_chars
+        pages.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip("\n")
+    return pages or [""]
+
+
+def render_status_panel_html(fields: Dict[str, str]) -> str:
+    if not fields:
+        return "状态读取中…"
+
+    header_order = ["天气", "地点", "日期", "时间"]
+    exclude = {"正文"}
+
+    lines: list[str] = []
+    for key in header_order:
+        if fields.get(key):
+            val = _markdown_bold_to_html(html.escape(fields[key], quote=False))
+            lines.append(f"<b>{html.escape(key, quote=False)}：</b>{val}")
+
+    other_keys = [k for k in fields.keys() if k not in set(header_order) and k not in exclude]
+    other_keys.sort()
+    for key in other_keys:
+        value = fields.get(key)
+        if not value:
+            continue
+        val = _markdown_bold_to_html(html.escape(str(value), quote=False))
+        lines.append(f"<b>{html.escape(key, quote=False)}：</b>{val}")
+
+    max_chars = 3500
+    output = ""
+    shown = 0
+    for ln in lines:
+        candidate = f"{output}\n{ln}" if output else ln
+        if len(candidate) > max_chars:
+            break
+        output = candidate
+        shown += 1
+
+    if shown < len(lines):
+        output += f"\n<b>…</b> 还有 {len(lines) - shown} 项（生成中/稍后发送）"
+    return output if output else "状态读取中…"
+
+
+def render_body_html(body: str) -> str:
+    escaped = _markdown_bold_to_html(html.escape(body or "", quote=False))
+    return escaped if escaped else "…"
+
+
+def render_tips_html(tips: str) -> str:
+    lines = [l.strip() for l in (tips or "").splitlines() if l.strip()]
+    joined = "\n".join(html.escape(l, quote=False) for l in lines)
+    return f"<b>行动建议</b>\n{joined}" if joined else "<b>行动建议</b>\n（无）"
+
+
+def render_full_state_messages(fields: Dict[str, str], *, exclude_keys: Optional[set[str]] = None) -> list[str]:
+    exclude_keys = exclude_keys or set()
+    items = [(k, v) for k, v in fields.items() if k not in exclude_keys and str(v).strip()]
+    if not items:
+        return []
+    items.sort(key=lambda kv: kv[0])
+
+    blocks: list[str] = []
+    current = "<b>状态（完整）</b>\n"
+    max_chars = 3500
+    for k, v in items:
+        line = f"<b>{html.escape(k, quote=False)}：</b>{_markdown_bold_to_html(html.escape(str(v), quote=False))}\n"
+        if len(current) + len(line) > max_chars:
+            blocks.append(current.rstrip())
+            current = "<b>状态（续）</b>\n" + line
+        else:
+            current += line
+    if current.strip():
+        blocks.append(current.rstrip())
+    return blocks
+
+
 async def send_preformatted_html(bot, chat_id: int, text: str, *, max_message_chars: int = 3800) -> None:
     if not text:
         return
@@ -721,6 +880,165 @@ async def handle_message_streaming(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text("? 无法连接 SillyTavern")
     except httpx.TimeoutException:
         await update.message.reply_text("⏱️ 响应超时，请稍后重试")
+    except Exception as e:
+        logger.error(f"Streaming message error: {e}")
+        await update.message.reply_text(f"? 错误: {e}")
+    finally:
+        typing_task.cancel()
+        try:
+            await typing_task
+        except Exception:
+            pass
+
+
+# New streaming UI: separate status panel + body stream (HTML, mobile-friendly)
+async def handle_message_streaming_ui(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        await maybe_send_register_hint(update)
+        return
+
+    user_id = str(update.effective_user.id)
+    user_name = update.effective_user.first_name or "User"
+    message = update.message.text
+
+    typing_task = asyncio.create_task(send_typing_periodically(update.message.chat, TELEGRAM_TYPING_INTERVAL_MS))
+    try:
+        status_message = await update.message.reply_text(TELEGRAM_STREAM_PLACEHOLDER)
+
+        buffer = ""
+        final_message: Optional[str] = None
+
+        status_mode = False
+        body_messages = []
+        tips_sent = False
+
+        last_edit = 0.0
+        edit_interval_s = max(0.2, TELEGRAM_STREAM_EDIT_INTERVAL_MS / 1000.0)
+
+        async for event in st_client.send_message_stream(user_id, message, user_name):
+            if isinstance(event.get('error'), str) and event['error']:
+                raise RuntimeError(event['error'])
+
+            delta = event.get('delta')
+            if isinstance(delta, str) and delta:
+                buffer += delta
+
+            if event.get('done') and isinstance(event.get('message'), str):
+                final_message = event['message']
+
+            now = time.monotonic()
+            if now - last_edit < edit_interval_s:
+                continue
+            if not buffer:
+                continue
+
+            lowered = buffer.lower()
+            if not status_mode and ("<stausblock" in lowered or "<statusblock" in lowered):
+                status_mode = True
+                await edit_message_html_if_changed(status_message, "状态读取中…")
+                body_messages.append(await update.message.reply_text("正文生成中…"))
+
+            if not status_mode:
+                await edit_message_if_changed(
+                    status_message,
+                    buffer[:4000] if buffer else TELEGRAM_STREAM_PLACEHOLDER,
+                )
+                last_edit = now
+                continue
+
+            fields_partial = parse_status_fields_partial(buffer)
+            await edit_message_html_if_changed(status_message, render_status_panel_html(fields_partial))
+
+            if not tips_sent and "</tips>" in lowered:
+                tips = extract_partial_between(buffer, "<TIPS>", "</TIPS>")
+                if tips is not None:
+                    tips_sent = True
+                    await context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text=render_tips_html(tips),
+                        parse_mode='HTML',
+                        disable_web_page_preview=True,
+                    )
+
+            body = extract_partial_between(
+                buffer,
+                "<正文>",
+                "</正文>",
+                stop_tags=["<TIPS>", "<变量>", "<秘氛>", "<邪名>", "</stausblock>", "</statusblock>"],
+            )
+            if body is not None:
+                if not body_messages:
+                    body_messages.append(await update.message.reply_text("正文生成中…"))
+                pages = split_text_pages(body, max_chars=3500)
+                while len(body_messages) < len(pages):
+                    body_messages.append(await update.message.reply_text("…"))
+                for i, page in enumerate(pages):
+                    await edit_message_html_if_changed(body_messages[i], f"<b>正文</b>\n{render_body_html(page)}")
+
+            last_edit = now
+
+        if final_message is None:
+            final_message = buffer.strip()
+
+        if not final_message:
+            final_message = '...'
+
+        if status_mode and looks_like_preformatted_block(final_message):
+            full_fields = parse_statusblock(final_message) or {}
+            if full_fields:
+                await edit_message_html_if_changed(status_message, render_status_panel_html(full_fields))
+
+                body_final = extract_partial_between(
+                    final_message,
+                    "<正文>",
+                    "</正文>",
+                    stop_tags=["<TIPS>", "<变量>", "<秘氛>", "<邪名>", "</stausblock>", "</statusblock>"],
+                )
+                if body_final is not None:
+                    if not body_messages:
+                        body_messages.append(await update.message.reply_text("…"))
+                    pages = split_text_pages(body_final, max_chars=3500)
+                    while len(body_messages) < len(pages):
+                        body_messages.append(await update.message.reply_text("…"))
+                    for i, page in enumerate(pages):
+                        await edit_message_html_if_changed(body_messages[i], f"<b>正文</b>\n{render_body_html(page)}")
+
+                for msg in render_full_state_messages(full_fields, exclude_keys={"正文"}):
+                    await context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text=msg,
+                        parse_mode='HTML',
+                        disable_web_page_preview=True,
+                    )
+
+                if full_fields.get("TIPS") and not tips_sent:
+                    await context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text=render_tips_html(full_fields["TIPS"]),
+                        parse_mode='HTML',
+                        disable_web_page_preview=True,
+                    )
+            return
+
+        if looks_like_preformatted_block(final_message):
+            if not await send_statusblock_html(context.bot, update.effective_chat.id, final_message):
+                await send_preformatted_html(context.bot, update.effective_chat.id, final_message)
+            return
+
+        await edit_message_if_changed(status_message, final_message[:4000])
+        if len(final_message) > 4000:
+            for i in range(4000, len(final_message), 4000):
+                await update.message.reply_text(final_message[i:i+4000])
+
+    except httpx.HTTPStatusError as e:
+        if getattr(e.response, "status_code", None) == 404:
+            await handle_message(update, context)
+        else:
+            await update.message.reply_text(f"? 错误: {e}")
+    except httpx.ConnectError:
+        await update.message.reply_text("? 无法连接 SillyTavern")
+    except httpx.TimeoutException:
+        await update.message.reply_text("?? 响应超时，请稍后重试")
     except Exception as e:
         logger.error(f"Streaming message error: {e}")
         await update.message.reply_text(f"? 错误: {e}")
@@ -1622,7 +1940,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     # Messages
-    message_handler = handle_message_streaming if TELEGRAM_STREAM_RESPONSES else handle_message
+    message_handler = handle_message_streaming_ui if TELEGRAM_STREAM_RESPONSES else handle_message
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
 
