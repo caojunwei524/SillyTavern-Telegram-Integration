@@ -24,7 +24,12 @@ let pluginConfig = {
     maxTokens: parseInt(process.env.LLM_MAX_TOKENS) || 2048,
     temperature: parseFloat(process.env.LLM_TEMPERATURE) || 0.9,
     presetName: process.env.PRESET_NAME || 'Default',
-    contextSize: parseInt(process.env.CONTEXT_SIZE) || 8192
+    contextSize: parseInt(process.env.CONTEXT_SIZE) || 8192,
+    ttsApiUrl: process.env.TTS_API_URL || process.env.LLM_API_URL || 'https://api.openai.com/v1',
+    ttsApiKey: process.env.TTS_API_KEY || process.env.LLM_API_KEY || '',
+    ttsModel: process.env.TTS_MODEL || '',
+    ttsVoice: process.env.TTS_VOICE || '',
+    ttsFormat: process.env.TTS_FORMAT || 'opus',
 };
 
 // 数据目录路径
@@ -728,6 +733,84 @@ async function callLLMApi(messages, preset, modelName = '') {
     return stripThinkingBlocks(data.choices[0]?.message?.content || '');
 }
 
+function getEffectiveTtsApiUrl() {
+    return (pluginConfig.ttsApiUrl || pluginConfig.llmApiUrl || '').replace(/\/$/, '');
+}
+
+function getEffectiveTtsApiKey() {
+    return pluginConfig.ttsApiKey || pluginConfig.llmApiKey || '';
+}
+
+function ttsEndpoint(baseUrl, path) {
+    const base = String(baseUrl || '').replace(/\/$/, '');
+    const normalizedPath = String(path || '').startsWith('/') ? String(path || '') : `/${path || ''}`;
+    // Support providers that expose OpenAI-compatible routes under /v1 (e.g. AI Hobbyist TTS).
+    // If the user sets TTS_API_URL ending with /v1, avoid duplicating /v1.
+    if (base.toLowerCase().endsWith('/v1')) {
+        return `${base}${normalizedPath}`;
+    }
+    return `${base}/v1${normalizedPath}`;
+}
+
+function audioContentTypeForFormat(format) {
+    const normalized = String(format || '').trim().toLowerCase();
+    if (normalized === 'mp3') return 'audio/mpeg';
+    if (normalized === 'wav') return 'audio/wav';
+    if (normalized === 'aac') return 'audio/aac';
+    if (normalized === 'flac') return 'audio/flac';
+    if (normalized === 'pcm') return 'audio/pcm';
+    if (normalized === 'opus') return 'audio/ogg';
+    if (normalized === 'ogg') return 'audio/ogg';
+    return 'application/octet-stream';
+}
+
+async function callTTSApi(text, { modelName = '', voiceName = '', responseFormat = '' } = {}) {
+    const apiKey = getEffectiveTtsApiKey();
+    if (!apiKey) {
+        throw new Error('TTS_API_KEY not configured');
+    }
+
+    const baseUrl = getEffectiveTtsApiUrl();
+    if (!baseUrl) {
+        throw new Error('TTS_API_URL not configured');
+    }
+
+    let model = (modelName || pluginConfig.ttsModel || '').trim();
+    let voice = (voiceName || pluginConfig.ttsVoice || '').trim();
+    // Some providers use "speaker name" as both model/voice; allow configuring only one.
+    if (!model && voice) model = voice;
+    if (!voice && model) voice = model;
+    const format = (responseFormat || pluginConfig.ttsFormat || 'opus').trim();
+
+    if (!model) throw new Error('TTS_MODEL not configured');
+    if (!voice) throw new Error('TTS_VOICE not configured');
+
+    const url = ttsEndpoint(baseUrl, '/audio/speech');
+    const requestBody = {
+        model,
+        voice,
+        input: String(text || ''),
+        response_format: format,
+    };
+
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`
+        },
+        body: JSON.stringify(requestBody)
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        throw new Error(`TTS API ${response.status}: ${String(errorText || '').substring(0, 200)}`);
+    }
+
+    const audio = Buffer.from(await response.arrayBuffer());
+    return { audio, contentType: audioContentTypeForFormat(format), format };
+}
+
 function stripThinkingBlocks(text) {
     if (!text || typeof text !== 'string') return '';
 
@@ -1084,7 +1167,11 @@ async function init(router) {
             version: '2.0.0',
             llmConfigured: !!pluginConfig.llmApiKey,
             llmModel: pluginConfig.llmModel,
-            preset: pluginConfig.presetName
+            preset: pluginConfig.presetName,
+            ttsConfigured: !!getEffectiveTtsApiKey() && !!(pluginConfig.ttsModel || pluginConfig.ttsVoice),
+            ttsModel: pluginConfig.ttsModel,
+            ttsVoice: pluginConfig.ttsVoice,
+            ttsFormat: pluginConfig.ttsFormat,
         });
     });
 
@@ -1098,7 +1185,12 @@ async function init(router) {
                 maxTokens: pluginConfig.maxTokens,
                 temperature: pluginConfig.temperature,
                 presetName: pluginConfig.presetName,
-                hasApiKey: !!pluginConfig.llmApiKey
+                hasApiKey: !!pluginConfig.llmApiKey,
+                ttsApiUrl: pluginConfig.ttsApiUrl,
+                ttsModel: pluginConfig.ttsModel,
+                ttsVoice: pluginConfig.ttsVoice,
+                ttsFormat: pluginConfig.ttsFormat,
+                hasTtsApiKey: !!getEffectiveTtsApiKey(),
             }
         });
     });
@@ -1112,11 +1204,39 @@ async function init(router) {
             const configPath = path.join(__dirname, 'config.json');
             const toSave = { ...pluginConfig };
             delete toSave.llmApiKey;
+            delete toSave.ttsApiKey;
             fs.writeFileSync(configPath, JSON.stringify(toSave, null, 2));
 
             res.json({ success: true });
         } catch (error) {
             res.status(500).json({ success: false, error: error.message });
+        }
+    });
+
+    // TTS: return raw audio bytes (OpenAI-compatible /audio/speech)
+    router.post('/tts', async (req, res) => {
+        try {
+            const body = req.body || {};
+            const text = typeof body.text === 'string' ? body.text : (typeof body.input === 'string' ? body.input : '');
+            if (!text.trim()) {
+                return res.status(400).json({ success: false, error: 'text required' });
+            }
+
+            const requestedModel = typeof body.ttsModel === 'string' ? body.ttsModel.trim() : '';
+            const requestedVoice = typeof body.voice === 'string' ? body.voice.trim() : '';
+            const requestedFormat = typeof body.format === 'string' ? body.format.trim() : (typeof body.response_format === 'string' ? body.response_format.trim() : '');
+
+            const { audio, contentType } = await callTTSApi(text, {
+                modelName: requestedModel,
+                voiceName: requestedVoice,
+                responseFormat: requestedFormat,
+            });
+
+            res.setHeader('Content-Type', contentType);
+            res.setHeader('Cache-Control', 'no-store');
+            return res.status(200).send(audio);
+        } catch (error) {
+            return res.status(500).json({ success: false, error: error.message });
         }
     });
 

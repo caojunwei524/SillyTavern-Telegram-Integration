@@ -11,12 +11,19 @@ import secrets
 import time
 import html
 import re
+import io
+import base64
+import hashlib
+import hmac
+import uuid
+from datetime import datetime
+from urllib.parse import quote
 from typing import Dict, Any, AsyncIterator, Optional
 from pathlib import Path
 
 import httpx
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import BadRequest
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram.error import BadRequest, Forbidden, RetryAfter
 from telegram.helpers import escape_markdown
 from telegram.ext import (
     Application,
@@ -54,6 +61,50 @@ TELEGRAM_STREAM_EDIT_INTERVAL_MS = int(os.getenv('TELEGRAM_STREAM_EDIT_INTERVAL_
 TELEGRAM_TYPING_INTERVAL_MS = int(os.getenv('TELEGRAM_TYPING_INTERVAL_MS', '3500'))
 TELEGRAM_STREAM_PLACEHOLDER = os.getenv('TELEGRAM_STREAM_PLACEHOLDER', '输入中...')
 
+# Optional voice reply via TTS (per-user toggle; provider configured via plugin)
+TG_TTS_MAX_CHARS = int(os.getenv('TG_TTS_MAX_CHARS', '1500'))
+TTS_PROVIDER = os.getenv('TTS_PROVIDER', 'plugin').strip().lower()  # plugin | edge
+# Edge TTS 配置（通过模拟 Microsoft Translator 签名获取）
+EDGE_TTS_DEFAULT_VOICE = os.getenv('EDGE_TTS_DEFAULT_VOICE', '').strip() or 'zh-CN-XiaoxiaoMultilingualNeural'
+EDGE_TTS_DEFAULT_RATE = os.getenv('EDGE_TTS_DEFAULT_RATE', '').strip() or '0'
+EDGE_TTS_DEFAULT_PITCH = os.getenv('EDGE_TTS_DEFAULT_PITCH', '').strip() or '0'
+EDGE_TTS_DEFAULT_STYLE = os.getenv('EDGE_TTS_DEFAULT_STYLE', '').strip() or 'general'
+EDGE_TTS_OUTPUT_FORMAT = os.getenv('EDGE_TTS_OUTPUT_FORMAT', '').strip() or 'audio-24khz-48kbitrate-mono-mp3'
+TG_TTS_CHOICES = [
+    v.strip()
+    for v in os.getenv('TG_TTS_CHOICES', '').split(',')
+    if v.strip()
+]
+
+
+def _parse_tts_choice(raw: str) -> tuple[str, str]:
+    raw = str(raw or "").strip()
+    if not raw:
+        return ("", "")
+    if "|" in raw:
+        voice, label = raw.split("|", 1)
+        voice = voice.strip()
+        label = label.strip()
+        return (voice, label or voice)
+    if "=" in raw:
+        voice, label = raw.split("=", 1)
+        voice = voice.strip()
+        label = label.strip()
+        return (voice, label or voice)
+    return (raw, raw)
+
+
+def _get_tts_choice_items() -> list[dict]:
+    items: list[dict] = []
+    seen: set[str] = set()
+    for raw in TG_TTS_CHOICES:
+        voice, label = _parse_tts_choice(raw)
+        if not voice or voice in seen:
+            continue
+        seen.add(voice)
+        items.append({"voice": voice, "label": label})
+    return items
+
 # Optional per-user model menu choices (comma-separated)
 TG_MODEL_CHOICES = [
     m.strip()
@@ -71,10 +122,32 @@ logger = logging.getLogger(__name__)
 # HTTP Client with optional Basic Auth
 _auth = httpx.BasicAuth(ST_AUTH_USER, ST_AUTH_PASS) if ST_AUTH_USER else None
 http_client = httpx.AsyncClient(timeout=120.0, auth=_auth)
+tts_http_client = httpx.AsyncClient(timeout=60.0)
 
 
 def md_escape(text: object) -> str:
     return escape_markdown(str(text), version=1)
+
+
+def strip_markdown_for_tts(text: str) -> str:
+    """清理 Markdown 格式符号，用于 TTS 朗读"""
+    s = str(text or "")
+    # 移除代码块 ```...```
+    s = re.sub(r'```[\s\S]*?```', '', s)
+    # 移除行内代码 `...`
+    s = re.sub(r'`[^`]*`', '', s)
+    # 移除加粗/斜体 **text** / *text* / __text__ / _text_
+    s = re.sub(r'\*\*(.+?)\*\*', r'\1', s)
+    s = re.sub(r'\*(.+?)\*', r'\1', s)
+    s = re.sub(r'__(.+?)__', r'\1', s)
+    s = re.sub(r'_(.+?)_', r'\1', s)
+    # 移除删除线 ~~text~~
+    s = re.sub(r'~~(.+?)~~', r'\1', s)
+    # 移除剩余的孤立格式符号
+    s = re.sub(r'[*_~`]+', '', s)
+    # 清理多余空白
+    s = re.sub(r'\n{3,}', '\n\n', s)
+    return s.strip()
 
 
 async def send_text_safe(send_func, text: str, *, parse_mode: str = None, reply_markup=None):
@@ -307,6 +380,72 @@ class AuthStore:
             self.data["userSettings"] = settings
             await self._save_unlocked()
 
+    def get_user_voice_enabled(self, user_id: int) -> bool:
+        settings = self.data.get("userSettings") or {}
+        entry = settings.get(str(user_id)) if isinstance(settings, dict) else None
+        if not isinstance(entry, dict):
+            return False
+        enabled = entry.get("voiceEnabled")
+        return bool(enabled) if isinstance(enabled, bool) else False
+
+    async def set_user_voice_enabled(self, user_id: int, enabled: bool) -> None:
+        key = str(user_id)
+        normalized = bool(enabled)
+
+        async with self._lock:
+            settings = self.data.get("userSettings")
+            if not isinstance(settings, dict):
+                settings = {}
+
+            entry = settings.get(key)
+            if not isinstance(entry, dict):
+                entry = {}
+
+            entry["voiceEnabled"] = normalized
+            settings[key] = entry
+
+            self.data["userSettings"] = settings
+            await self._save_unlocked()
+
+    def get_user_tts_voice(self, user_id: int) -> Optional[str]:
+        settings = self.data.get("userSettings") or {}
+        entry = settings.get(str(user_id)) if isinstance(settings, dict) else None
+        if not isinstance(entry, dict):
+            return None
+        voice = entry.get("ttsVoice")
+        if not isinstance(voice, str):
+            return None
+        voice = voice.strip()
+        return voice or None
+
+    async def set_user_tts_voice(self, user_id: int, voice: Optional[str]) -> None:
+        key = str(user_id)
+        normalized = None
+        if isinstance(voice, str):
+            normalized = voice.strip() or None
+
+        async with self._lock:
+            settings = self.data.get("userSettings")
+            if not isinstance(settings, dict):
+                settings = {}
+
+            entry = settings.get(key)
+            if not isinstance(entry, dict):
+                entry = {}
+
+            if normalized is None:
+                entry.pop("ttsVoice", None)
+                if entry:
+                    settings[key] = entry
+                else:
+                    settings.pop(key, None)
+            else:
+                entry["ttsVoice"] = normalized
+                settings[key] = entry
+
+            self.data["userSettings"] = settings
+            await self._save_unlocked()
+
 
 class SillyTavernClient:
     """SillyTavern API Client"""
@@ -382,6 +521,19 @@ class SillyTavernClient:
         if isinstance(llm_model, str) and llm_model.strip():
             payload['llmModel'] = llm_model.strip()
         return await self._post('/send', payload)
+
+    async def tts(self, text: str, *, tts_model: Optional[str] = None, voice: Optional[str] = None, response_format: Optional[str] = None) -> bytes:
+        url = f"{self.base_url}{self.api_prefix}/tts"
+        payload: Dict[str, Any] = {"text": str(text or "")}
+        if isinstance(tts_model, str) and tts_model.strip():
+            payload["ttsModel"] = tts_model.strip()
+        if isinstance(voice, str) and voice.strip():
+            payload["voice"] = voice.strip()
+        if isinstance(response_format, str) and response_format.strip():
+            payload["format"] = response_format.strip()
+        response = await http_client.post(url, json=payload)
+        response.raise_for_status()
+        return response.content
 
     async def send_message_stream(self, user_id: str, message: str, user_name: str, llm_model: Optional[str] = None) -> AsyncIterator[Dict[str, Any]]:
         url = f"{self.base_url}{self.api_prefix}/send/stream"
@@ -495,7 +647,9 @@ async def maybe_send_register_hint(update: Update) -> None:
         pass
 
 
-def get_main_menu() -> InlineKeyboardMarkup:
+def get_main_menu(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
+    voice_enabled = auth_store.get_user_voice_enabled(user_id) if isinstance(user_id, int) else False
+    voice_label = "🔊 语音回复：开" if voice_enabled else "🔇 语音回复：关"
     keyboard = [
         [InlineKeyboardButton("🎭 选择角色", callback_data="menu_characters")],
         [InlineKeyboardButton("📋 选择预设", callback_data="menu_presets")],
@@ -506,6 +660,8 @@ def get_main_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("ℹ️ 当前状态", callback_data="menu_status")],
     ]
     keyboard.insert(3, [InlineKeyboardButton("🧠 我的模型", callback_data="menu_my_model")])
+    keyboard.insert(4, [InlineKeyboardButton(voice_label, callback_data="menu_voice_toggle")])
+    keyboard.insert(5, [InlineKeyboardButton("🎙️ 选择音色", callback_data="menu_tts_voice")])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -873,6 +1029,179 @@ async def send_preformatted_html(bot, chat_id: int, text: str, *, max_message_ch
         await bot.send_message(chat_id=chat_id, text=payload, parse_mode='HTML')
 
 
+# Edge TTS 常量（模拟 Microsoft Translator App）
+_EDGE_ENDPOINT_URL = "https://dev.microsofttranslator.com/apps/endpoint?api-version=1.0"
+_EDGE_USER_AGENT = "okhttp/4.5.0"
+_EDGE_CLIENT_VERSION = "4.0.530a 5fe1dc6c"
+_EDGE_USER_ID = "0f04d16a175c411e"
+_EDGE_HOME_REGION = "zh-Hans-CN"
+_EDGE_CLIENT_TRACE_ID = "aab069b9-70a7-4844-a734-96cd78d94be9"
+_EDGE_DECODE_KEY = "oik6PdDdMnOXemTbwvMn9de/h9lFnfBaCWbGMMZqqoSaQaqUOqjVGm5NqsmjcBI1x+sS9ugjB55HEJWRiFXYFw=="
+
+_edge_endpoint_lock = asyncio.Lock()
+_edge_endpoint_cache: Optional[dict] = None
+_edge_endpoint_expires_at: float = 0.0
+
+
+def _edge_sign(url_str: str) -> str:
+    """生成 Microsoft Translator 签名"""
+    u = url_str.split("://")[1]
+    encoded_url = quote(u, safe='')
+    uuid_str = str(uuid.uuid4()).replace("-", "")
+    formatted_date = datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S").lower() + "gmt"
+    bytes_to_sign = f"MSTranslatorAndroidApp{encoded_url}{formatted_date}{uuid_str}".lower().encode('utf-8')
+    decode = base64.b64decode(_EDGE_DECODE_KEY)
+    hmac_sha256 = hmac.new(decode, bytes_to_sign, hashlib.sha256)
+    secret_key = hmac_sha256.digest()
+    sign_base64 = base64.b64encode(secret_key).decode()
+    return f"MSTranslatorAndroidApp::{sign_base64}::{formatted_date}::{uuid_str}"
+
+
+async def _edge_get_endpoint() -> dict:
+    """获取 TTS endpoint（带缓存）"""
+    global _edge_endpoint_cache, _edge_endpoint_expires_at
+
+    now = time.time()
+    if _edge_endpoint_cache and now < _edge_endpoint_expires_at - 60:
+        return _edge_endpoint_cache
+
+    async with _edge_endpoint_lock:
+        now = time.time()
+        if _edge_endpoint_cache and now < _edge_endpoint_expires_at - 60:
+            return _edge_endpoint_cache
+
+        signature = _edge_sign(_EDGE_ENDPOINT_URL)
+        headers = {
+            "Accept-Language": "zh-Hans",
+            "X-ClientVersion": _EDGE_CLIENT_VERSION,
+            "X-UserId": _EDGE_USER_ID,
+            "X-HomeGeographicRegion": _EDGE_HOME_REGION,
+            "X-ClientTraceId": _EDGE_CLIENT_TRACE_ID,
+            "X-MT-Signature": signature,
+            "User-Agent": _EDGE_USER_AGENT,
+            "Content-Type": "application/json; charset=utf-8",
+        }
+        resp = await tts_http_client.post(_EDGE_ENDPOINT_URL, headers=headers, content=b"")
+        resp.raise_for_status()
+        endpoint = resp.json()
+
+        # 解析 JWT 获取过期时间
+        jwt_parts = endpoint['t'].split('.')
+        if len(jwt_parts) >= 2:
+            jwt_payload = jwt_parts[1]
+            # 补齐 base64 padding
+            padding = 4 - len(jwt_payload) % 4
+            if padding != 4:
+                jwt_payload += '=' * padding
+            decoded_jwt = json.loads(base64.b64decode(jwt_payload).decode('utf-8'))
+            _edge_endpoint_expires_at = decoded_jwt.get('exp', now + 600)
+        else:
+            _edge_endpoint_expires_at = now + 600
+
+        _edge_endpoint_cache = endpoint
+        return endpoint
+
+
+def _edge_build_ssml(text: str, *, voice_name: str, rate: str, pitch: str, style: str) -> str:
+    """构建 SSML"""
+    safe_text = html.escape(str(text or ""), quote=False)
+    safe_voice = html.escape(str(voice_name or EDGE_TTS_DEFAULT_VOICE), quote=True)
+    safe_style = html.escape(str(style or EDGE_TTS_DEFAULT_STYLE), quote=True)
+
+    return (
+        '<speak xmlns="http://www.w3.org/2001/10/synthesis" '
+        'xmlns:mstts="http://www.w3.org/2001/mstts" version="1.0" xml:lang="zh-CN">'
+        f'<voice name="{safe_voice}">'
+        f'<mstts:express-as style="{safe_style}" styledegree="1.0" role="default">'
+        f'<prosody rate="{rate}%" pitch="{pitch}%">{safe_text}</prosody>'
+        '</mstts:express-as>'
+        '</voice>'
+        '</speak>'
+    )
+
+
+async def edge_tts(text: str, *, voice_name: Optional[str] = None) -> bytes:
+    """Edge TTS 语音合成"""
+    endpoint = await _edge_get_endpoint()
+    voice = (voice_name or EDGE_TTS_DEFAULT_VOICE).strip() or EDGE_TTS_DEFAULT_VOICE
+    ssml = _edge_build_ssml(
+        str(text or ""),
+        voice_name=voice,
+        rate=EDGE_TTS_DEFAULT_RATE,
+        pitch=EDGE_TTS_DEFAULT_PITCH,
+        style=EDGE_TTS_DEFAULT_STYLE,
+    )
+    tts_url = f"https://{endpoint['r']}.tts.speech.microsoft.com/cognitiveservices/v1"
+    resp = await tts_http_client.post(
+        tts_url,
+        headers={
+            "Authorization": endpoint["t"],
+            "Content-Type": "application/ssml+xml",
+            "X-Microsoft-OutputFormat": EDGE_TTS_OUTPUT_FORMAT,
+        },
+        content=ssml.encode("utf-8"),
+    )
+    resp.raise_for_status()
+    return resp.content
+
+
+_tts_warned_user_ids: set[int] = set()
+_voice_send_warned_user_ids: set[int] = set()
+
+
+async def maybe_send_voice_reply(context: ContextTypes.DEFAULT_TYPE, *, user_id: int, chat_id: int, text: str) -> None:
+    if not auth_store.get_user_voice_enabled(user_id):
+        return
+
+    # 清理 Markdown 格式符号，避免朗读星号等
+    normalized = strip_markdown_for_tts(text)
+    if not normalized:
+        return
+
+    clipped = normalized[: max(32, TG_TTS_MAX_CHARS)]
+    try:
+        user_voice = auth_store.get_user_tts_voice(user_id)
+        provider = (TTS_PROVIDER or "plugin").strip().lower()
+        if provider == "edge":
+            audio = await edge_tts(clipped, voice_name=user_voice or EDGE_TTS_DEFAULT_VOICE)
+        else:
+            audio = await st_client.tts(clipped, tts_model=user_voice, voice=user_voice) if user_voice else await st_client.tts(clipped)
+        if not audio:
+            return
+        voice_file = InputFile(io.BytesIO(audio), filename="reply.ogg")
+        try:
+            await context.bot.send_voice(chat_id=chat_id, voice=voice_file)
+        except RetryAfter:
+            return
+        except Forbidden as e:
+            if user_id not in _voice_send_warned_user_ids:
+                _voice_send_warned_user_ids.add(user_id)
+                await context.bot.send_message(chat_id=chat_id, text="语音发送失败：对方隐私设置/限制语音消息；已保留文字回复，可在菜单关闭语音回复。")
+            logger.error(f"Voice send forbidden: {e}")
+        except BadRequest as e:
+            if user_id not in _voice_send_warned_user_ids:
+                _voice_send_warned_user_ids.add(user_id)
+                await context.bot.send_message(chat_id=chat_id, text="语音发送失败：对方隐私设置/限制语音消息；已保留文字回复，可在菜单关闭语音回复。")
+            logger.error(f"Voice send bad request: {e}")
+    except httpx.HTTPStatusError as e:
+        if user_id not in _tts_warned_user_ids:
+            _tts_warned_user_ids.add(user_id)
+            detail = ""
+            try:
+                data = e.response.json()
+                if isinstance(data, dict) and isinstance(data.get("error"), str):
+                    detail = f"\n{data['error']}"
+            except Exception:
+                detail = ""
+            await context.bot.send_message(chat_id=chat_id, text=f"语音生成失败（请先配置 TTS）。{detail}".strip())
+        logger.error(f"TTS HTTP error: {e}")
+    except Exception as e:
+        if user_id not in _tts_warned_user_ids:
+            _tts_warned_user_ids.add(user_id)
+            await context.bot.send_message(chat_id=chat_id, text="语音生成失败（请先配置 TTS）。")
+        logger.error(f"TTS error: {e}")
+
+
 async def handle_message_streaming(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
         await maybe_send_register_hint(update)
@@ -932,6 +1261,7 @@ async def handle_message_streaming(update: Update, context: ContextTypes.DEFAULT
         if len(final_message) > 4000:
             for i in range(4000, len(final_message), 4000):
                 await update.message.reply_text(final_message[i:i+4000])
+        await maybe_send_voice_reply(context, user_id=update.effective_user.id, chat_id=update.effective_chat.id, text=final_message)
 
     except httpx.HTTPStatusError as e:
         if getattr(e.response, "status_code", None) == 404:
@@ -1092,6 +1422,7 @@ async def handle_message_streaming_ui(update: Update, context: ContextTypes.DEFA
         if len(final_message) > 4000:
             for i in range(4000, len(final_message), 4000):
                 await update.message.reply_text(final_message[i:i+4000])
+        await maybe_send_voice_reply(context, user_id=update.effective_user.id, chat_id=update.effective_chat.id, text=final_message)
 
     except httpx.HTTPStatusError as e:
         if getattr(e.response, "status_code", None) == 404:
@@ -1129,7 +1460,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "支持预设、世界书、完整角色卡\n\n"
         "直接发送消息即可与角色对话\n"
         "使用下方按钮进行设置：",
-        reply_markup=get_main_menu(),
+        reply_markup=get_main_menu(update.effective_user.id),
         parse_mode='Markdown'
     )
 
@@ -1562,6 +1893,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     await update.message.reply_text(ai_response[i:i+4000])
             else:
                 await update.message.reply_text(ai_response)
+            await maybe_send_voice_reply(context, user_id=update.effective_user.id, chat_id=update.effective_chat.id, text=ai_response)
         else:
             error = result.get('error', 'Unknown error')
             await update.message.reply_text(f"❌ {error}")
@@ -1775,6 +2107,124 @@ async def show_my_model_menu(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await send_text_safe(update.message.reply_text, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
 
+async def show_tts_voice_menu(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                              is_callback: bool = True, *, page: int = 0) -> None:
+    query = update.callback_query if is_callback else None
+    if query:
+        await query.answer()
+
+    user = update.effective_user
+    if not user:
+        return
+    if not is_authorized(user.id):
+        await maybe_send_register_hint(update)
+        return
+
+    voice_enabled = auth_store.get_user_voice_enabled(user.id)
+    user_voice = auth_store.get_user_tts_voice(user.id)
+
+    default_model = None
+    default_voice = None
+    default_format = None
+    provider = (TTS_PROVIDER or "plugin").strip().lower()
+    if provider == "azure":
+        default_model = "azure"
+        default_voice = AZURE_TTS_DEFAULT_VOICE
+        default_format = AZURE_TTS_OUTPUT_FORMAT
+    else:
+        try:
+            result = await st_client.get_plugin_config()
+            cfg = result.get("config", {}) if isinstance(result, dict) else {}
+            default_model = cfg.get("ttsModel")
+            default_voice = cfg.get("ttsVoice")
+            default_format = cfg.get("ttsFormat")
+        except Exception:
+            default_model = None
+            default_voice = None
+            default_format = None
+
+    default_model = str(default_model).strip() if isinstance(default_model, str) else None
+    default_voice = str(default_voice).strip() if isinstance(default_voice, str) else None
+    default_format = str(default_format).strip() if isinstance(default_format, str) else None
+
+    choices: list[dict] = []
+    seen: set[str] = set()
+    if default_voice:
+        seen.add(default_voice)
+        choices.append({"voice": default_voice, "label": f"（默认）{default_voice}"})
+
+    for item in _get_tts_choice_items():
+        voice = item.get("voice")
+        if not isinstance(voice, str) or not voice.strip():
+            continue
+        voice = voice.strip()
+        if voice in seen:
+            continue
+        seen.add(voice)
+        label = item.get("label")
+        label = str(label).strip() if isinstance(label, str) else voice
+        choices.append({"voice": voice, "label": label or voice})
+
+    if user_voice and user_voice not in seen:
+        seen.add(user_voice)
+        choices.append({"voice": user_voice, "label": f"（我的）{user_voice}"})
+
+    context.user_data['tts_voices'] = choices
+
+    keyboard: list[list[InlineKeyboardButton]] = []
+    page_size = 10
+    safe_page = max(0, int(page or 0))
+    start = safe_page * page_size
+    end = start + page_size
+
+    row: list[InlineKeyboardButton] = []
+    for idx, item in enumerate(choices[start:end], start=start):
+        voice = item.get("voice") if isinstance(item, dict) else None
+        label = item.get("label") if isinstance(item, dict) else None
+        voice = str(voice).strip() if isinstance(voice, str) else ""
+        label = str(label).strip() if isinstance(label, str) else voice
+        if not voice:
+            continue
+        shown = label or voice
+        if voice == user_voice:
+            shown = f"✅ {shown}"
+        shown = shown if len(shown) <= 18 else (shown[:17] + "…")
+        row.append(InlineKeyboardButton(shown, callback_data=f"tts_voice_idx_{idx}"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+
+    total_pages = max(1, (len(choices) + page_size - 1) // page_size)
+    if total_pages > 1:
+        prev_page = (safe_page - 1) % total_pages
+        next_page = (safe_page + 1) % total_pages
+        keyboard.append([
+            InlineKeyboardButton("⬅️", callback_data=f"tts_voice_page_{prev_page}"),
+            InlineKeyboardButton(f"{safe_page + 1}/{total_pages}", callback_data="tts_voice_page_noop"),
+            InlineKeyboardButton("➡️", callback_data=f"tts_voice_page_{next_page}"),
+        ])
+
+    keyboard.append([InlineKeyboardButton("🧹 清除我的音色", callback_data="tts_voice_clear")])
+    keyboard.append([InlineKeyboardButton("🔙 返回", callback_data="menu_main")])
+
+    text = (
+        "🎙️ **我的音色**（仅对你生效）\n\n"
+        f"- 语音回复：`{md_escape('开启' if voice_enabled else '关闭')}`\n"
+        f"- 我的音色：`{md_escape(user_voice or '（未设置）')}`\n"
+        f"- 默认模型：`{md_escape(default_model or '（未配置）')}`\n"
+        f"- 默认音色：`{md_escape(default_voice or '（未配置）')}`\n"
+        f"- 格式：`{md_escape(default_format or 'opus')}`\n\n"
+        "提示：如果你开了“语音回复”，但没配置 TTS 或音色不支持，会自动只发文字。"
+    )
+
+    if query:
+        await send_text_safe(query.edit_message_text, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    else:
+        await send_text_safe(update.message.reply_text, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+
 async def show_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -1877,7 +2327,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer()
         await send_text_safe(query.edit_message_text,
             "🎭 **SillyTavern Telegram Bot**\n\n选择操作：",
-            reply_markup=get_main_menu(),
+            reply_markup=get_main_menu(actor_id),
             parse_mode='Markdown'
         )
 
@@ -1892,6 +2342,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     elif data == "menu_my_model":
         await show_my_model_menu(update, context)
+
+    elif data == "menu_voice_toggle":
+        await query.answer()
+        next_value = not auth_store.get_user_voice_enabled(actor_id)
+        await auth_store.set_user_voice_enabled(actor_id, next_value)
+
+        note = "（尚未配置 TTS 时不会发送语音）" if next_value else ""
+        text = f"语音回复已{'开启' if next_value else '关闭'}{note}"
+        await send_text_safe(
+            query.edit_message_text,
+            text,
+            reply_markup=get_main_menu(actor_id),
+            parse_mode='Markdown',
+        )
+
+    elif data == "menu_tts_voice":
+        await show_tts_voice_menu(update, context)
 
     elif data == "menu_history":
         await show_history(update, context)
@@ -1909,6 +2376,38 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         await auth_store.set_user_llm_model(actor_id, model_name)
         await show_my_model_menu(update, context)
+
+    elif data == "tts_voice_clear":
+        await query.answer()
+        await auth_store.set_user_tts_voice(actor_id, None)
+        await show_tts_voice_menu(update, context)
+
+    elif data.startswith("tts_voice_idx_"):
+        await query.answer()
+        try:
+            idx = int(data.split("_")[-1])
+        except Exception:
+            await query.edit_message_text("无效操作")
+            return
+        voices = context.user_data.get('tts_voices') or []
+        item = voices[idx] if isinstance(voices, list) and 0 <= idx < len(voices) else None
+        voice = item.get("voice") if isinstance(item, dict) else (item if isinstance(item, str) else None)
+        if not isinstance(voice, str) or not voice.strip():
+            await query.edit_message_text("音色不存在或已过期，请重新打开菜单。")
+            return
+        await auth_store.set_user_tts_voice(actor_id, voice)
+        await show_tts_voice_menu(update, context)
+
+    elif data.startswith("tts_voice_page_"):
+        await query.answer()
+        page_str = data.split("_")[-1]
+        if page_str == "noop":
+            return
+        try:
+            page = int(page_str)
+        except Exception:
+            page = 0
+        await show_tts_voice_menu(update, context, page=page)
 
     elif data.startswith("hist_"):
         await query.answer()

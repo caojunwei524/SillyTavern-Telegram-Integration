@@ -21,6 +21,12 @@ services:
       - LLM_MAX_TOKENS=${LLM_MAX_TOKENS:-1024}
       - LLM_TEMPERATURE=${LLM_TEMPERATURE:-0.8}
       - PRESET_NAME=${PRESET_NAME:-Default}
+      # TTS（语音消息）：可选，默认复用 LLM_API_*；模型/voice 需自行设置
+      - TTS_API_URL=${TTS_API_URL:-}
+      - TTS_API_KEY=${TTS_API_KEY:-}
+      - TTS_MODEL=${TTS_MODEL:-}
+      - TTS_VOICE=${TTS_VOICE:-}
+      - TTS_FORMAT=${TTS_FORMAT:-opus}
     # 启动时自动安装插件依赖
     command: >
       sh -c "npm install --prefix /home/node/app/plugins/telegram-integration && node server.js"
@@ -53,6 +59,14 @@ services:
       - TELEGRAM_STREAM_EDIT_INTERVAL_MS=${TELEGRAM_STREAM_EDIT_INTERVAL_MS:-750}
       - TELEGRAM_TYPING_INTERVAL_MS=${TELEGRAM_TYPING_INTERVAL_MS:-3500}
       - TELEGRAM_STREAM_PLACEHOLDER=${TELEGRAM_STREAM_PLACEHOLDER:-输入中...}
+      - TG_TTS_MAX_CHARS=${TG_TTS_MAX_CHARS:-1500}
+      - TG_TTS_CHOICES=${TG_TTS_CHOICES:-zh-CN-XiaoxiaoNeural=晓晓,zh-CN-YunxiNeural=云希,zh-CN-YunjianNeural=云健,zh-CN-XiaoyiNeural=晓伊,zh-CN-YunyangNeural=云扬,zh-CN-XiaochenNeural=晓辰,zh-CN-XiaochenMultilingualNeural=晓辰 多语言,zh-CN-XiaohanNeural=晓涵,zh-CN-XiaomengNeural=晓梦,zh-CN-XiaomoNeural=晓墨,zh-CN-XiaoqiuNeural=晓秋,zh-CN-XiaorouNeural=晓柔,zh-CN-XiaoruiNeural=晓睿,zh-CN-XiaoshuangNeural=晓双,zh-CN-XiaoxiaoDialectsNeural=晓晓 方言,zh-CN-XiaoxiaoMultilingualNeural=晓晓 多语言,zh-CN-XiaoyanNeural=晓颜,zh-CN-XiaoyouNeural=晓悠,zh-CN-XiaoyuMultilingualNeural=晓宇 多语言,zh-CN-XiaozhenNeural=晓甄,zh-CN-YunfengNeural=云枫,zh-CN-YunhaoNeural=云皓,zh-CN-YunjieNeural=云杰,zh-CN-YunxiaNeural=云夏,zh-CN-YunyeNeural=云野,zh-CN-YunyiMultilingualNeural=云逸 多语言,zh-CN-YunzeNeural=云泽,zh-CN-YunfanMultilingualNeural=Yunfan Multilingual,zh-CN-YunxiaoMultilingualNeural=Yunxiao Multilingual}
+      - TTS_PROVIDER=${TTS_PROVIDER:-edge}
+      - EDGE_TTS_DEFAULT_VOICE=${EDGE_TTS_DEFAULT_VOICE:-zh-CN-XiaoxiaoMultilingualNeural}
+      - EDGE_TTS_DEFAULT_STYLE=${EDGE_TTS_DEFAULT_STYLE:-general}
+      - EDGE_TTS_DEFAULT_RATE=${EDGE_TTS_DEFAULT_RATE:-0}
+      - EDGE_TTS_DEFAULT_PITCH=${EDGE_TTS_DEFAULT_PITCH:-0}
+      - EDGE_TTS_OUTPUT_FORMAT=${EDGE_TTS_OUTPUT_FORMAT:-ogg-24khz-16bit-mono-opus}
       # SillyTavern Basic Auth（与 config.yaml 中的密码一致）
       - ST_AUTH_USER=${ST_AUTH_USER:-}
       - ST_AUTH_PASS=${ST_AUTH_PASS:-}

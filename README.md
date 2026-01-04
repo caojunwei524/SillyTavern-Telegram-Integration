@@ -11,6 +11,7 @@
 | 📚 世界书支持 | 自动匹配 WorldInfo/Lorebook 条目，支持常驻条目 |
 | 💬 完整对话 | 保持对话历史，支持长对话 |
 | 🔄 多开场白 | 支持 alternate_greetings 切换 |
+| 🔊 语音回复 | 支持 Edge TTS 语音合成，自动清理 Markdown 格式 |
 | ⏰ 时间宏 | 支持 `{{time}}`, `{{date}}`, `{{weekday}}` 等 |
 | 🎲 随机宏 | 支持 `{{random:a,b,c}}`, `{{roll:2d6}}` 骰子 |
 | 🔒 用户授权 | 仅允许指定用户使用 Bot |
@@ -246,10 +247,15 @@ docker compose ps
 | `TG_CONCURRENT_UPDATES` | 可选 | 8 | Bot 并发处理消息数（多用户建议调大） |
 | `TG_CONNECTION_POOL_SIZE` | 可选 | 64 | Telegram Bot API 连接池大小 |
 | `TG_POOL_TIMEOUT` | 可选 | 30 | 连接池等待超时（秒） |
-| `TELEGRAM_STREAM_RESPONSES` | 可选 | 1 | 启用“输入中”与流式编辑（SSE） |
+| `TELEGRAM_STREAM_RESPONSES` | 可选 | 1 | 启用"输入中"与流式编辑（SSE） |
 | `TELEGRAM_STREAM_EDIT_INTERVAL_MS` | 可选 | 750 | 流式编辑刷新间隔（毫秒） |
 | `TELEGRAM_TYPING_INTERVAL_MS` | 可选 | 3500 | 发送 typing 动作间隔（毫秒） |
 | `TELEGRAM_STREAM_PLACEHOLDER` | 可选 | 输入中... | 首条占位文本 |
+| `TTS_PROVIDER` | 可选 | edge | TTS 提供商（`edge` 或 `plugin`） |
+| `TG_TTS_MAX_CHARS` | 可选 | 1500 | 语音合成最大字符数 |
+| `EDGE_TTS_DEFAULT_VOICE` | 可选 | zh-CN-XiaoxiaoMultilingualNeural | Edge TTS 默认音色 |
+| `EDGE_TTS_OUTPUT_FORMAT` | 可选 | ogg-24khz-16bit-mono-opus | Edge TTS 输出格式 |
+| `TG_TTS_CHOICES` | 可选 | - | 可选音色列表（格式：`音色=标签,音色=标签`） |
 
 **配置示例：**
 ```bash
@@ -283,6 +289,12 @@ TELEGRAM_STREAM_RESPONSES=1
 TELEGRAM_STREAM_EDIT_INTERVAL_MS=750
 TELEGRAM_TYPING_INTERVAL_MS=3500
 TELEGRAM_STREAM_PLACEHOLDER=输入中...
+
+# 可选 - TTS 语音回复
+TTS_PROVIDER=edge
+TG_TTS_MAX_CHARS=1500
+EDGE_TTS_DEFAULT_VOICE=zh-CN-XiaoxiaoMultilingualNeural
+EDGE_TTS_OUTPUT_FORMAT=ogg-24khz-16bit-mono-opus
 ```
 
 ### 预设支持
@@ -301,6 +313,20 @@ TELEGRAM_STREAM_PLACEHOLDER=输入中...
 - **常驻条目** - `constant: true` 的条目始终激活
 - **位置控制** - before/after 消息
 - **排序** - 按 `order` 字段排序插入
+
+### TTS 语音回复
+
+支持 AI 回复自动转语音，使用 Edge TTS（免费）：
+
+- **开关控制** - 用户可在菜单中开关语音回复
+- **音色选择** - 支持多种中文音色（晓晓、云希等）
+- **Markdown 清理** - 自动清理 `*斜体*`、`**加粗**` 等格式符号，避免朗读星号
+- **格式兼容** - 使用 OGG Opus 格式，手机和电脑端均可播放
+
+**可用音色示例（TG_TTS_CHOICES）：**
+```
+zh-CN-XiaoxiaoNeural=晓晓,zh-CN-YunxiNeural=云希,zh-CN-YunjianNeural=云健
+```
 
 ### 宏替换
 
